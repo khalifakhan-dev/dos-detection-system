@@ -1,0 +1,35 @@
+capture:
+  interface: "auto"
+  protected_ip: ""
+  protected_ports: [80, 443]
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  token: "change-this-lab-token"
+
+storage:
+  database_path: "logs/dos_detection.sqlite3"
+
+mitigation:
+  dry_run: true
+  default_quarantine_seconds: 300
+  repeated_detection_window_seconds: 600
+  repeated_detection_limit: 2
+  escalation_quarantine_seconds: 900
+  trusted_ips: []
+
+thresholds:
+  syn_packets_per_second: 250
+  syn_completion_rate_max: 0.20
+  udp_packets_per_second: 500
+  udp_bytes_per_second: 500000
+  icmp_packets_per_second: 250
+  http_long_lived_connections: 30
+  http_incomplete_connections: 20
+  http_connection_age_seconds: 30
+  source_packets_per_second: 150
+
+logging:
+  level: "INFO"
+  file: "logs/dos_detector.log"
