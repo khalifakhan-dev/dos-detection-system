@@ -30,6 +30,8 @@ class TrafficWindow:
     http_long_lived_connections: int = 0
     http_max_connection_age_seconds: float = 0.0
     source_packets_per_second: float = 0.0
+    # Values are plain dictionaries so API/SQLite JSON serialization remains stable.
+    source_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

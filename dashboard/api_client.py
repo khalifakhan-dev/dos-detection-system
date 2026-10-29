@@ -28,6 +28,13 @@ class ApiClient:
     def blocks(self) -> list[dict[str, Any]]:
         return self._request("GET", "/api/blocks?active_only=true")
 
+    def events(self, limit: int = 100) -> list[dict[str, Any]]:
+        return self._request("GET", f"/api/events?limit={limit}")
+
+    def incidents(self, active_only: bool = False, limit: int = 100) -> list[dict[str, Any]]:
+        value = "true" if active_only else "false"
+        return self._request("GET", f"/api/incidents?active_only={value}&limit={limit}")
+
     def unblock(self, ip: str) -> dict[str, Any]:
         return self._request("POST", f"/api/blocks/{ip}/unblock", json={})
 

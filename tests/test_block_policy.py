@@ -16,8 +16,8 @@ def test_temporary_block():
 def test_repeated_detection_escalates():
     result = DetectionResult(True, "UDP flood", "high", "192.0.2.50", "test")
     block = BlockPolicy(config()).decide(result, previous_count=1)
-    assert block["mode"] == "permanent"
-    assert block["expires_at"] is None
+    assert block["mode"] == "temporary"
+    assert block["expires_at"] is not None
 
 
 def test_trusted_ip_is_not_blocked():

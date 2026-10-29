@@ -1,12 +1,15 @@
 capture:
   interface: "auto"
   protected_ip: ""
-  protected_ports: [80, 443]
+  # Plaintext HTTP ports inspected for Slowloris. 443 is deliberately not listed:
+  # TLS payloads are encrypted, so incomplete-header detection cannot work there.
+  http_ports: [80]
+  bpf_filter: "ip"          # IPv4 only; "" disables the kernel filter (needs tcpdump installed)
 
 api:
-  host: "0.0.0.0"
+  host: "0.0.0.0"           # set to the host-only interface IP of the lab VM when possible
   port: 8000
-  token: "change-this-lab-token"
+  token: "change-this-lab-token"   # CHANGE THIS (or set DOS_API_TOKEN); an empty token disables the API
 
 storage:
   database_path: "logs/dos_detection.sqlite3"
@@ -16,6 +19,9 @@ mitigation:
   default_quarantine_seconds: 300
   repeated_detection_window_seconds: 600
   repeated_detection_limit: 2
+  mitigation_retry_cooldown_seconds: 60
+  incident_inactivity_timeout_seconds: 30
+  manual_unblock_grace_seconds: 60
   escalation_quarantine_seconds: 900
   trusted_ips: []
 
@@ -29,6 +35,11 @@ thresholds:
   http_incomplete_connections: 20
   http_connection_age_seconds: 30
   source_packets_per_second: 150
+
+retention:
+  max_metric_rows: 86400
+  max_event_rows: 100000
+  max_sources_per_window: 20
 
 logging:
   level: "INFO"

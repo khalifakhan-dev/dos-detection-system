@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -12,10 +11,8 @@ logger = logging.getLogger(__name__)
 
 
 class UnblockScheduler:
-    def __init__(self, database: Any, nftables: Any, interval_seconds: float = 2.0):
-        self.database = database
-        self.nftables = nftables
-        self.interval_seconds = interval_seconds
+    def __init__(self, database: Any, nftables: Any, interval_seconds: float = 2.0, on_expire: Any = None):
+        self.database, self.nftables, self.interval_seconds, self.on_expire = database, nftables, interval_seconds, on_expire
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -33,17 +30,31 @@ class UnblockScheduler:
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval_seconds):
-            now = datetime.now(timezone.utc)
-            for block in self.database.blocks(active_only=True):
-                expires_at = block.get("expires_at")
-                if block.get("mode") == "temporary" and expires_at:
-                    try:
-                        expiry = datetime.fromisoformat(expires_at)
-                    except ValueError:
-                        logger.warning("Invalid expiry timestamp for %s", block.get("ip"))
-                        continue
-                    if expiry <= now:
-                        ip = block["ip"]
-                        result = self.nftables.unblock(ip)
-                        self.database.update_block_status(ip, "expired", utc_now_iso())
-                        self.database.add_event("automatic_unblock", {"result": result}, ip, utc_now_iso())
+            try:
+                self._expire_due_blocks()
+            except Exception:  # one bad tick must never end the scheduler thread
+                logger.exception("Unblock scheduler tick failed; will retry")
+
+    def _expire_due_blocks(self) -> None:
+        now = datetime.now(timezone.utc)
+        for block in self.database.blocks(active_only=True):
+            expires_at = block.get("expires_at")
+            if block.get("mode") != "temporary" or not expires_at:
+                continue
+            try:
+                if datetime.fromisoformat(expires_at) > now:
+                    continue
+                self._expire(block)
+            except Exception:
+                logger.exception("Failed to expire block for %s", block.get("ip"))
+
+    def _expire(self, block: dict[str, Any]) -> None:
+        ip = block["ip"]
+        result = self.nftables.unblock(ip)
+        result["simulated"] = bool(result.get("dry_run"))
+        outcome = "mitigation_simulated" if result["simulated"] else ("mitigation_success" if result.get("success") else "mitigation_failed")
+        if result.get("success"):
+            self.database.update_block_status(ip, "expired", utc_now_iso())
+        self.database.add_event(outcome, {"outcome": outcome, "action": "automatic_unblock", "result": result}, ip, utc_now_iso())
+        if result.get("success") and self.on_expire:
+            self.on_expire(ip)

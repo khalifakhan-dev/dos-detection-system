@@ -19,6 +19,7 @@ class Dashboard(ctk.CTk):
         self.geometry("1100x720")
         self.queue: Queue[tuple[str, Any]] = Queue()
         self.refresh_ms = 2000
+        self._refresh_in_progress = False
         self._build_ui()
         self.after(100, self._consume_queue)
         self.after(200, self.refresh)
@@ -38,13 +39,16 @@ class Dashboard(ctk.CTk):
 
         tabs = ctk.CTkTabview(self)
         tabs.grid(row=2, column=0, padx=12, pady=8, sticky="nsew")
-        tabs.add("Alerts")
+        tabs.add("Active Incidents")
+        tabs.add("Historical Alerts")
         tabs.add("Active Blocks")
         tabs.add("Events")
-        for name in ("Alerts", "Active Blocks", "Events"):
+        for name in ("Active Incidents", "Historical Alerts", "Active Blocks", "Events"):
             tabs.tab(name).grid_rowconfigure(0, weight=1)
             tabs.tab(name).grid_columnconfigure(0, weight=1)
-        self.alerts_box = ctk.CTkTextbox(tabs.tab("Alerts"), font=("Consolas", 12))
+        self.incidents_box = ctk.CTkTextbox(tabs.tab("Active Incidents"), font=("Consolas", 12))
+        self.incidents_box.grid(row=0, column=0, padx=8, pady=8, sticky="nsew")
+        self.alerts_box = ctk.CTkTextbox(tabs.tab("Historical Alerts"), font=("Consolas", 12))
         self.alerts_box.grid(row=0, column=0, padx=8, pady=8, sticky="nsew")
         self.blocks_box = ctk.CTkTextbox(tabs.tab("Active Blocks"), font=("Consolas", 12))
         self.blocks_box.grid(row=0, column=0, padx=8, pady=8, sticky="nsew")
@@ -60,14 +64,18 @@ class Dashboard(ctk.CTk):
         ctk.CTkButton(controls, text="Refresh Now", command=self.refresh).grid(row=0, column=3, padx=8, pady=8)
 
     def refresh(self) -> None:
-        threading.Thread(target=self._load_data, daemon=True).start()
+        if not self._refresh_in_progress:
+            self._refresh_in_progress = True
+            threading.Thread(target=self._load_data, daemon=True).start()
         self.after(self.refresh_ms, self.refresh)
 
     def _load_data(self) -> None:
         try:
-            self.queue.put(("data", {"status": self.client.status(), "metrics": self.client.metrics(), "alerts": self.client.alerts(), "blocks": self.client.blocks()}))
+            self.queue.put(("data", {"status": self.client.status(), "metrics": self.client.metrics(), "incidents": self.client.incidents(active_only=True), "alerts": self.client.alerts(), "blocks": self.client.blocks(), "events": self.client.events()}))
         except Exception as exc:
             self.queue.put(("error", str(exc)))
+        finally:
+            self._refresh_in_progress = False
 
     def _consume_queue(self) -> None:
         try:
@@ -92,13 +100,10 @@ class Dashboard(ctk.CTk):
             f"HTTP incomplete: {window.get('http_incomplete_connections', 0)}\n"
             f"Latest detection: {detection.get('attack_type') or 'Normal'}    Source: {detection.get('source_ip') or '-'}    Reason: {detection.get('reason') or '-'}"
         ))
-        self._replace(self.alerts_box, "\n".join(self._format_alert(row) for row in data["alerts"]) or "No alerts recorded.")
+        self._replace(self.incidents_box, "\n".join(self._format_incident(row) for row in data["incidents"]) or "No active incidents.")
+        self._replace(self.alerts_box, "\n".join(self._format_alert(row) for row in data["alerts"]) or "No historical alerts recorded.")
         self._replace(self.blocks_box, "\n".join(self._format_block(row) for row in data["blocks"]) or "No active blocks.")
-        try:
-            events = self.client._request("GET", "/api/events?limit=100")
-            self._replace(self.events_box, "\n".join(str(row) for row in events) or "No events recorded.")
-        except Exception:
-            pass
+        self._replace(self.events_box, "\n".join(str(row) for row in data.get("events", [])) or "No events recorded.")
 
     @staticmethod
     def _replace(widget: ctk.CTkTextbox, text: str) -> None:
@@ -112,8 +117,18 @@ class Dashboard(ctk.CTk):
         return f"[{row.get('timestamp')}] {row.get('severity')} {row.get('attack_type')} from {row.get('source_ip')} | {row.get('reason')}"
 
     @staticmethod
+    def _format_incident(row: dict[str, Any]) -> str:
+        return f"{row.get('status', 'active').upper()} | {row.get('attack_type')} | source={row.get('source_ip') or 'uncertain'} | first={row.get('first_seen')} | last={row.get('last_seen')}"
+
+    @staticmethod
     def _format_block(row: dict[str, Any]) -> str:
-        return f"{row.get('ip')} | mode={row.get('mode')} | status={row.get('status')} | expires={row.get('expires_at')} | reason={row.get('reason')}"
+        if row.get("dry_run"):
+            state = "SIMULATED (dry-run; no real firewall change)"
+        elif row.get("status") == "active":
+            state = "REAL FIREWALL BLOCK ACTIVE"
+        else:
+            state = f"REAL FIREWALL {str(row.get('status', 'unknown')).upper()}"
+        return f"{row.get('ip')} | {state} | mode={row.get('mode')} | expires={row.get('expires_at')} | reason={row.get('reason')}"
 
     def _get_ip(self) -> str | None:
         value = self.ip_entry.get().strip()
@@ -126,8 +141,8 @@ class Dashboard(ctk.CTk):
         ip = self._get_ip()
         if ip and messagebox.askyesno("Confirm unblock", f"Unblock {ip}?"):
             try:
-                self.client.unblock(ip)
-                messagebox.showinfo("Success", f"Unblock request sent for {ip}.")
+                result = self.client.unblock(ip)
+                self._show_action_result("Unblock", ip, result)
                 self.refresh()
             except Exception as exc:
                 messagebox.showerror("Unblock failed", str(exc))
@@ -136,11 +151,20 @@ class Dashboard(ctk.CTk):
         ip = self._get_ip()
         if ip and messagebox.askyesno("Confirm permanent block", f"Keep {ip} blocked until manually unblocked?"):
             try:
-                self.client.permanent_block(ip)
-                messagebox.showinfo("Success", f"Permanent block request sent for {ip}.")
+                result = self.client.permanent_block(ip)
+                self._show_action_result("Permanent block", ip, result)
                 self.refresh()
             except Exception as exc:
                 messagebox.showerror("Block failed", str(exc))
+
+    @staticmethod
+    def _show_action_result(action: str, ip: str, result: dict[str, Any]) -> None:
+        if not result.get("success"):
+            messagebox.showerror(f"{action} failed", result.get("stderr") or result.get("error") or "The API reported failure.")
+        elif result.get("dry_run") or result.get("simulated"):
+            messagebox.showwarning("Simulation only", f"{action} for {ip} was simulated (dry-run); no nftables change was made.")
+        else:
+            messagebox.showinfo("Success", f"{action} succeeded for {ip}.")
 
 
 def main() -> None:

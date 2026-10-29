@@ -36,6 +36,15 @@ def test_slowloris_detection():
     assert result.attack_type == "HTTP Slowloris"
 
 
+def test_single_old_http_connection_is_not_slowloris():
+    result = detector().evaluate(TrafficWindow(
+        http_incomplete_connections=1,
+        http_max_connection_age_seconds=300,
+        top_source_ip="192.0.2.14",
+    ))
+    assert result.detected is False
+
+
 def test_normal_traffic():
     result = detector().evaluate(TrafficWindow(total_packets=4, tcp_packets=4, ack_packets=3))
     assert result.detected is False
