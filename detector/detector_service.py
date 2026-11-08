@@ -189,7 +189,7 @@ class DetectorService:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
-            return {"started_at": self.started_at, "capture_running": bool(self._thread and self._thread.is_alive()), "dry_run": self.nftables.dry_run, "mitigation_ready": self._mitigation_ready, "ruleset_result": self._ruleset_result, "latest_window": self._latest_window, "latest_detection": self._latest_result}
+            return {"started_at": self.started_at, "capture_running": bool(self._thread and self._thread.is_alive()), "capture_health": self.capture.health(), "dry_run": self.nftables.dry_run, "mitigation_ready": self._mitigation_ready, "ruleset_result": self._ruleset_result, "latest_window": self._latest_window, "latest_detection": self._latest_result}
 
     @staticmethod
     def _timestamp_minus(timestamp: str, seconds: float) -> str:

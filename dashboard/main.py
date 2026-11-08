@@ -9,6 +9,7 @@ from typing import Any
 import customtkinter as ctk
 
 from dashboard.api_client import ApiClient
+from dashboard.time_format import format_for_display, format_timestamp
 
 
 class Dashboard(ctk.CTk):
@@ -20,9 +21,13 @@ class Dashboard(ctk.CTk):
         self.queue: Queue[tuple[str, Any]] = Queue()
         self.refresh_ms = 2000
         self._refresh_in_progress = False
+        self._closing = False
+        self._poll_timer = None
+        self._queue_timer = None
         self._build_ui()
-        self.after(100, self._consume_queue)
-        self.after(200, self.refresh)
+        self._queue_timer = self.after(100, self._consume_queue)
+        self._poll_timer = self.after(200, self._poll)
+        self.protocol("WM_DELETE_WINDOW", self._close)
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
@@ -63,11 +68,24 @@ class Dashboard(ctk.CTk):
         ctk.CTkButton(controls, text="Permanent Block", command=self.permanent_block).grid(row=0, column=2, padx=8, pady=8)
         ctk.CTkButton(controls, text="Refresh Now", command=self.refresh).grid(row=0, column=3, padx=8, pady=8)
 
+    def _poll(self) -> None:
+        if self._closing:
+            return
+        self.refresh()
+        self._poll_timer = self.after(self.refresh_ms, self._poll)
+
     def refresh(self) -> None:
-        if not self._refresh_in_progress:
-            self._refresh_in_progress = True
-            threading.Thread(target=self._load_data, daemon=True).start()
-        self.after(self.refresh_ms, self.refresh)
+        if self._closing or self._refresh_in_progress:
+            return
+        self._refresh_in_progress = True
+        threading.Thread(target=self._load_data, daemon=True).start()
+
+    def _close(self) -> None:
+        self._closing = True
+        for timer in (self._poll_timer, self._queue_timer):
+            if timer is not None:
+                self.after_cancel(timer)
+        self.destroy()
 
     def _load_data(self) -> None:
         try:
@@ -81,17 +99,28 @@ class Dashboard(ctk.CTk):
         try:
             while True:
                 kind, payload = self.queue.get_nowait()
-                if kind == "error":
+                if kind == "action":
+                    action, ip, result, error = payload
+                    if error:
+                        messagebox.showerror(f"{action} failed", error)
+                    else:
+                        self._show_action_result(action, ip, result)
+                        self.refresh()
+                elif kind == "error":
                     self.status_label.configure(text=f"Disconnected: {payload}", text_color="#d9534f")
                 else:
                     self._render(payload)
         except Empty:
             pass
-        self.after(100, self._consume_queue)
+        if not self._closing:
+            self._queue_timer = self.after(100, self._consume_queue)
 
     def _render(self, data: dict[str, Any]) -> None:
         status = data["status"]
-        self.status_label.configure(text=f"Connected | capture={status.get('capture_running')} | dry-run={status.get('dry_run')}", text_color="#2e8b57")
+        health = status.get("capture_health") or {}
+        capture_state = health.get("state", "UNKNOWN")
+        self.status_label.configure(text=f"Connected | capture={capture_state} | dry-run={status.get('dry_run')}",
+                                    text_color="#d9534f" if capture_state == "ERROR" else "#2e8b57")
         window = status.get("latest_window") or (data["metrics"][-1] if data["metrics"] else {})
         detection = status.get("latest_detection", {})
         self.metrics_label.configure(text=(
@@ -103,7 +132,7 @@ class Dashboard(ctk.CTk):
         self._replace(self.incidents_box, "\n".join(self._format_incident(row) for row in data["incidents"]) or "No active incidents.")
         self._replace(self.alerts_box, "\n".join(self._format_alert(row) for row in data["alerts"]) or "No historical alerts recorded.")
         self._replace(self.blocks_box, "\n".join(self._format_block(row) for row in data["blocks"]) or "No active blocks.")
-        self._replace(self.events_box, "\n".join(str(row) for row in data.get("events", [])) or "No events recorded.")
+        self._replace(self.events_box, "\n".join(str(format_for_display(row)) for row in data.get("events", [])) or "No events recorded.")
 
     @staticmethod
     def _replace(widget: ctk.CTkTextbox, text: str) -> None:
@@ -114,11 +143,11 @@ class Dashboard(ctk.CTk):
 
     @staticmethod
     def _format_alert(row: dict[str, Any]) -> str:
-        return f"[{row.get('timestamp')}] {row.get('severity')} {row.get('attack_type')} from {row.get('source_ip')} | {row.get('reason')}"
+        return f"[{format_timestamp(row.get('timestamp'))}] {row.get('severity')} {row.get('attack_type')} from {row.get('source_ip')} | {row.get('reason')}"
 
     @staticmethod
     def _format_incident(row: dict[str, Any]) -> str:
-        return f"{row.get('status', 'active').upper()} | {row.get('attack_type')} | source={row.get('source_ip') or 'uncertain'} | first={row.get('first_seen')} | last={row.get('last_seen')}"
+        return f"{row.get('status', 'active').upper()} | {row.get('attack_type')} | source={row.get('source_ip') or 'uncertain'} | first={format_timestamp(row.get('first_seen'))} | last={format_timestamp(row.get('last_seen'))}"
 
     @staticmethod
     def _format_block(row: dict[str, Any]) -> str:
@@ -128,7 +157,7 @@ class Dashboard(ctk.CTk):
             state = "REAL FIREWALL BLOCK ACTIVE"
         else:
             state = f"REAL FIREWALL {str(row.get('status', 'unknown')).upper()}"
-        return f"{row.get('ip')} | {state} | mode={row.get('mode')} | expires={row.get('expires_at')} | reason={row.get('reason')}"
+        return f"{row.get('ip')} | {state} | mode={row.get('mode')} | expires={format_timestamp(row.get('expires_at'))} | reason={row.get('reason')}"
 
     def _get_ip(self) -> str | None:
         value = self.ip_entry.get().strip()
@@ -137,25 +166,24 @@ class Dashboard(ctk.CTk):
             return None
         return value
 
+    def _admin_action(self, action: str, ip: str, operation: Any) -> None:
+        def worker() -> None:
+            try:
+                result = operation()
+                self.queue.put(("action", (action, ip, result, None)))
+            except Exception as exc:
+                self.queue.put(("action", (action, ip, None, str(exc))))
+        threading.Thread(target=worker, daemon=True).start()
+
     def unblock_ip(self) -> None:
         ip = self._get_ip()
         if ip and messagebox.askyesno("Confirm unblock", f"Unblock {ip}?"):
-            try:
-                result = self.client.unblock(ip)
-                self._show_action_result("Unblock", ip, result)
-                self.refresh()
-            except Exception as exc:
-                messagebox.showerror("Unblock failed", str(exc))
+            self._admin_action("Unblock", ip, lambda: self.client.unblock(ip))
 
     def permanent_block(self) -> None:
         ip = self._get_ip()
         if ip and messagebox.askyesno("Confirm permanent block", f"Keep {ip} blocked until manually unblocked?"):
-            try:
-                result = self.client.permanent_block(ip)
-                self._show_action_result("Permanent block", ip, result)
-                self.refresh()
-            except Exception as exc:
-                messagebox.showerror("Block failed", str(exc))
+            self._admin_action("Permanent block", ip, lambda: self.client.permanent_block(ip))
 
     @staticmethod
     def _show_action_result(action: str, ip: str, result: dict[str, Any]) -> None:

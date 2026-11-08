@@ -20,6 +20,8 @@ class _HttpConnection:
     started: float
     last_seen: float
     complete: bool = False
+    header: bytes = b""
+    next_seq: int | None = None
 
 
 @dataclass
@@ -40,12 +42,14 @@ class WindowAccumulator:
 
 class FeatureExtractor:
     def __init__(self, window_seconds: float = 1.0, http_age_seconds: float = 30.0,
-                 http_ports: tuple[int, ...] = (80,), max_http_connections: int = 50000):
+                 http_ports: tuple[int, ...] = (80,), max_http_connections: int = 50000,
+                 max_http_header_bytes: int = 8192):
         self.window_seconds = window_seconds
         self.http_age_seconds = http_age_seconds
         # Only plaintext HTTP ports are meaningful: TLS payloads never expose a header terminator.
         self.http_ports = frozenset(int(p) for p in http_ports)
         self.max_http_connections = max_http_connections
+        self.max_http_header_bytes = max_http_header_bytes
         self.http_table_overflows = 0
         self._window = WindowAccumulator()
         self._http_connections: dict[tuple[str, int, str, int], _HttpConnection] = {}
@@ -87,21 +91,51 @@ class FeatureExtractor:
             stats["icmp_bytes"] += len(packet)
 
     def _track_http(self, source_ip: str, dst_ip: str, tcp: Any, flags: int) -> None:
-        key = (source_ip, int(tcp.sport), dst_ip, int(tcp.dport))
-        if flags & 0x05:  # FIN or RST: the connection is closed, stop tracking it
+        # Track only client -> configured plaintext HTTP server traffic.
+        client_direction = int(tcp.dport) in self.http_ports
+        key = ((source_ip, int(tcp.sport), dst_ip, int(tcp.dport)) if client_direction
+               else (dst_ip, int(tcp.dport), source_ip, int(tcp.sport)))
+        if flags & 0x05:  # FIN or RST from either endpoint
             self._http_connections.pop(key, None)
             return
+        if not client_direction:
+            return
+        raw = bytes(tcp.payload) if getattr(tcp, "payload", None) else b""
+        if not raw:
+            return  # SYN/ACK handshakes alone are not HTTP requests
         now = monotonic()
         connection = self._http_connections.get(key)
         if connection is None:
             if len(self._http_connections) >= self.max_http_connections:
-                self.http_table_overflows += 1  # bound memory under spoofed-port floods
+                self.http_table_overflows += 1
+                return
+            # Do not count arbitrary non-HTTP payloads as incomplete requests.
+            if not any(raw.startswith(method) for method in
+                       (b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ",
+                        b"OPTIONS ", b"PATCH ", b"CONNECT ", b"TRACE ")):
                 return
             connection = _HttpConnection(source_ip, now, now)
             self._http_connections[key] = connection
+        if connection.complete:
+            return
         connection.last_seen = now
-        raw = bytes(tcp.payload) if getattr(tcp, "payload", None) else b""
-        if b"\r\n\r\n" in raw or b"\n\n" in raw:
+        seq = int(tcp.seq)
+        if connection.next_seq is not None:
+            if seq > connection.next_seq:
+                # Out-of-order segments are not reassembled by this bounded parser.
+                return
+            overlap = connection.next_seq - seq
+            if overlap >= len(raw):
+                return
+            raw = raw[overlap:]
+        connection.next_seq = seq + len(raw)
+        available = self.max_http_header_bytes - len(connection.header)
+        if len(raw) > available:
+            # Oversized headers cannot be safely classified: drop this state.
+            self._http_connections.pop(key, None)
+            return
+        connection.header += raw
+        if b"\r\n\r\n" in connection.header or b"\n\n" in connection.header:
             connection.complete = True
 
     def finish(self) -> TrafficWindow:
@@ -121,6 +155,13 @@ class FeatureExtractor:
         duration = max(self.window_seconds, now - current.started)
         top_ip, top_count = current.sources.most_common(1)[0] if current.sources else (None, 0)
         source_stats = {ip: {**stats, **http_by_source.get(ip, {}), "packets_per_second": stats["packets"] / duration} for ip, stats in current.source_stats.items()}
+        for ip, http_stats in http_by_source.items():
+            if ip not in source_stats:
+                source_stats[ip] = {"packets": 0, "bytes": 0, "tcp_packets": 0,
+                                    "syn_packets": 0, "ack_packets": 0, "udp_packets": 0,
+                                    "udp_bytes": 0, "icmp_packets": 0, "icmp_bytes": 0,
+                                    "packets_per_second": 0.0, **http_stats}
+
         result = TrafficWindow(
             timestamp=utc_now_iso(), duration_seconds=duration, total_packets=current.packets, total_bytes=current.bytes,
             tcp_packets=current.tcp, syn_packets=current.syn, ack_packets=current.ack, udp_packets=current.udp,
