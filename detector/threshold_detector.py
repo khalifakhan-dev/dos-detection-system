@@ -5,7 +5,7 @@ from typing import Any, Iterable
 from .traffic_models import DetectionResult, TrafficWindow
 
 # Rule priority: protocol-specific rules win over the generic per-source rule.
-_SYN, _UDP, _ICMP, _SOURCE, _HTTP = range(5)
+_SYN, _UDP, _ICMP, _HTTP, _SOURCE = range(5)
 
 
 class ThresholdDetector:
@@ -37,7 +37,18 @@ class ThresholdDetector:
             if hit:
                 found.append(hit)
                 flagged.add(ip)
-        found.extend(self._http_rules(window, flagged, common))
+        # Do not let a generic packet-rate alert hide an HTTP-specific alert.
+        http_results = self._http_rules(window, set(), common)
+        http_sources = {
+            result.source_ip for _, _, result in http_results
+            if result.source_ip is not None
+        }
+        found = [
+            item for item in found
+            if not (item[2].source_ip in http_sources
+                    and item[2].attack_type == "Source packet flood")
+        ]
+        found.extend(http_results)
         # Aggregate counters remain useful when traffic is distributed across many
         # sources, but no single source can be attributed reliably. Never fall back
         # to top_source_ip for these detections.
@@ -101,8 +112,8 @@ class ThresholdDetector:
         return found
 
     def _http_result(self, window: TrafficWindow, source_ip: str | None, common: dict[str, Any], long_thr: int, inc_thr: int) -> DetectionResult:
-        return DetectionResult(True, "HTTP Slowloris", "medium", source_ip,
-            "Long-lived or incomplete HTTP connection threshold exceeded",
+        return DetectionResult(True, "HTTP attack", "medium", source_ip,
+            "Suspicious HTTP connection activity exceeded the configured threshold",
             {"http_active_connections": window.http_active_connections, "http_incomplete_connections": window.http_incomplete_connections, "http_long_lived_connections": window.http_long_lived_connections, "http_max_connection_age_seconds": window.http_max_connection_age_seconds, **common},
             {"http_long_lived_connections": long_thr, "http_incomplete_connections": inc_thr, "http_connection_age_seconds": self.thresholds.get("http_connection_age_seconds")})
 
@@ -129,7 +140,7 @@ class ThresholdDetector:
     # ---- helpers ------------------------------------------------------------
     @staticmethod
     def _priority(attack_type: str | None) -> int:
-        return {"TCP SYN flood": _SYN, "UDP flood": _UDP, "ICMP flood": _ICMP, "Source packet flood": _SOURCE, "HTTP Slowloris": _HTTP}.get(attack_type, _HTTP)
+        return {"TCP SYN flood": _SYN, "UDP flood": _UDP, "ICMP flood": _ICMP, "Source packet flood": _SOURCE, "HTTP attack": _HTTP}.get(attack_type, _HTTP)
 
     @staticmethod
     def _common(window: TrafficWindow) -> dict[str, Any]:

@@ -20,6 +20,7 @@ class _HttpConnection:
     started: float
     last_seen: float
     complete: bool = False
+    closed: bool = False
     header: bytes = b""
     next_seq: int | None = None
 
@@ -96,7 +97,14 @@ class FeatureExtractor:
         key = ((source_ip, int(tcp.sport), dst_ip, int(tcp.dport)) if client_direction
                else (dst_ip, int(tcp.dport), source_ip, int(tcp.sport)))
         if flags & 0x05:  # FIN or RST from either endpoint
-            self._http_connections.pop(key, None)
+            connection = self._http_connections.get(key)
+            if connection is not None:
+                if connection.complete:
+                    self._http_connections.pop(key, None)
+                else:
+                    # Include a closed incomplete request in this capture window
+                    # only, then remove it in finish().
+                    connection.closed = True
             return
         if not client_direction:
             return
@@ -105,6 +113,9 @@ class FeatureExtractor:
             return  # SYN/ACK handshakes alone are not HTTP requests
         now = monotonic()
         connection = self._http_connections.get(key)
+        if connection is not None and connection.closed:
+            self._http_connections.pop(key, None)
+            connection = None
         if connection is None:
             if len(self._http_connections) >= self.max_http_connections:
                 self.http_table_overflows += 1
@@ -171,5 +182,10 @@ class FeatureExtractor:
             http_long_lived_connections=len(long_lived), http_max_connection_age_seconds=max(ages, default=0.0),
             source_packets_per_second=top_count / duration, source_stats=source_stats,
         )
+        # Closed incomplete requests count for exactly one completed window.
+        self._http_connections = {
+            key: conn for key, conn in self._http_connections.items()
+            if not conn.closed
+        }
         self._window = WindowAccumulator()
         return result
