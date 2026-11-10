@@ -33,7 +33,7 @@ def test_icmp_flood_detection():
 
 def test_slowloris_detection():
     result = detector().evaluate(TrafficWindow(http_incomplete_connections=3, top_source_ip="192.0.2.13"))
-    assert result.attack_type == "HTTP Slowloris"
+    assert result.attack_type == "HTTP attack"
 
 
 def test_single_old_http_connection_is_not_slowloris():
