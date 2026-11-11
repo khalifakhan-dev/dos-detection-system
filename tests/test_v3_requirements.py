@@ -68,6 +68,24 @@ def test_real_ruleset_failure_is_not_ready(monkeypatch, tmp_path):
     service = DetectorService({"thresholds": _thresholds(), "mitigation": {"dry_run": False}}, db)
     service.start(capture=False)
     assert service.status()["mitigation_ready"] is False
+    # Manual is the default: detection continues, but blocking must not occur.
+    attempted = []
+    service.nftables.block = lambda *args, **kwargs: attempted.append((args, kwargs))
     service.process_window(_attack("2026-01-01T00:00:00+00:00"))
-    assert db.events(2)[0]["event_type"] == "mitigation_not_ready"
+    assert service.mitigation_mode() == "manual"
+    assert service.status()["latest_detection"]["detected"] is True
+    assert attempted == []
+    assert db.blocks(active_only=True) == []
+
+    # Automatic mode must also fail closed when the firewall is unavailable.
+    service.set_mitigation_mode("automatic")
+    service.process_window(_attack("2026-01-01T00:00:01+00:00"))
+    assert service.status()["mitigation_ready"] is False
+    assert attempted == []
+    assert db.blocks(active_only=True) == []
+
+    # An explicit administrator block must be rejected as well.
+    import pytest
+    with pytest.raises(ValueError, match="not ready"):
+        service.permanent_block("192.0.2.10")
     service.stop()
