@@ -150,6 +150,8 @@ class DetectorService:
         self.database.add_event("detection", {"outcome": "detection", "result": result_dict}, result.source_ip, timestamp)
         if not result.source_ip:
             return  # Never block unattributed aggregate traffic.
+        if self.policy.is_trusted(result.source_ip):
+            return  # Keep detection evidence in SQLite, but never offer trusted IPs for blocking.
         key = (result.source_ip, result.attack_type or "unknown")
         with self._lock:
             previous_alert = self._live_alerts.get(key, {})
@@ -212,7 +214,7 @@ class DetectorService:
         with self._lock:
             key = (ip, attack_type)
             if key not in self._live_alerts:
-                raise ValueError("Alert is no longer active")
+                return {"success": True, "ip": ip, "attack_type": attack_type, "expired": True}
             self._live_alerts[key]["ignored"] = True
         self.database.add_event("alert_ignored", {"attack_type": attack_type}, ip, utc_now_iso())
         return {"success": True, "ip": ip, "attack_type": attack_type}
