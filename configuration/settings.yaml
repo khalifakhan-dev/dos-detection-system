@@ -34,7 +34,6 @@ thresholds:
   http_long_lived_connections: 30
   http_incomplete_connections: 20
   http_connection_age_seconds: 30
-  source_packets_per_second: 150
 
 retention:
   max_metric_rows: 86400

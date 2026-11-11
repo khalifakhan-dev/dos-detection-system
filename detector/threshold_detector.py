@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any
 
 from .traffic_models import DetectionResult, TrafficWindow
 
-# Rule priority: protocol-specific rules win over the generic per-source rule.
-_SYN, _UDP, _ICMP, _HTTP, _SOURCE = range(5)
+# Rule priority: protocol-specific detections only.
+_SYN, _UDP, _ICMP, _HTTP = range(4)
 
 
 class ThresholdDetector:
-    def __init__(self, thresholds: dict[str, Any], generic_exempt: Iterable[str] = ()):
-        """generic_exempt: sources (e.g. the protected server itself, whose responses
-        look like a high-rate source) that are skipped by the generic packet-rate rule only."""
+    def __init__(self, thresholds: dict[str, Any]):
         self.thresholds = thresholds
-        self.generic_exempt = set(generic_exempt)
 
     # ---- public API -------------------------------------------------------
     def evaluate(self, window: TrafficWindow) -> DetectionResult:
@@ -37,18 +34,7 @@ class ThresholdDetector:
             if hit:
                 found.append(hit)
                 flagged.add(ip)
-        # Do not let a generic packet-rate alert hide an HTTP-specific alert.
-        http_results = self._http_rules(window, set(), common)
-        http_sources = {
-            result.source_ip for _, _, result in http_results
-            if result.source_ip is not None
-        }
-        found = [
-            item for item in found
-            if not (item[2].source_ip in http_sources
-                    and item[2].attack_type == "Source packet flood")
-        ]
-        found.extend(http_results)
+        found.extend(self._http_rules(window, flagged, common))
         # Aggregate counters remain useful when traffic is distributed across many
         # sources, but no single source can be attributed reliably. Never fall back
         # to top_source_ip for these detections.
@@ -85,13 +71,6 @@ class ThresholdDetector:
                 {"icmp_packets": icmp, "icmp_bytes": int(stats.get("icmp_bytes", 0)), **common},
                 {"icmp_packets_per_second": t.get("icmp_packets_per_second")})
 
-        packets = int(stats.get("packets", 0))
-        rate = packets / duration
-        if ip not in self.generic_exempt and rate >= float(t.get("source_packets_per_second", 150)):
-            return _SOURCE, rate, DetectionResult(True, "Source packet flood", "high", ip,
-                "Per-source packet rate exceeded the configured threshold",
-                {"source_packets": packets, "source_packets_per_second": rate, **common},
-                {"source_packets_per_second": t.get("source_packets_per_second", 150)})
         return None
 
     def _http_rules(self, window: TrafficWindow, flagged: set[str], common: dict[str, Any]) -> list[tuple[int, float, DetectionResult]]:
@@ -140,7 +119,7 @@ class ThresholdDetector:
     # ---- helpers ------------------------------------------------------------
     @staticmethod
     def _priority(attack_type: str | None) -> int:
-        return {"TCP SYN flood": _SYN, "UDP flood": _UDP, "ICMP flood": _ICMP, "Source packet flood": _SOURCE, "HTTP attack": _HTTP}.get(attack_type, _HTTP)
+        return {"TCP SYN flood": _SYN, "UDP flood": _UDP, "ICMP flood": _ICMP, "HTTP attack": _HTTP}.get(attack_type, _HTTP)
 
     @staticmethod
     def _common(window: TrafficWindow) -> dict[str, Any]:

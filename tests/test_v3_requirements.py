@@ -12,7 +12,7 @@ def _thresholds():
         "udp_packets_per_second": 1000,
         "udp_bytes_per_second": 1000000,
         "icmp_packets_per_second": 1000,
-        "source_packets_per_second": 1000,
+
         "http_long_lived_connections": 2,
         "http_incomplete_connections": 2,
     }

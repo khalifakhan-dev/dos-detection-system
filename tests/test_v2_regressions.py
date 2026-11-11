@@ -8,7 +8,7 @@ def thresholds():
     return {
         "syn_packets_per_second": 10, "syn_completion_rate_max": 0.2,
         "udp_packets_per_second": 10, "udp_bytes_per_second": 1000,
-        "icmp_packets_per_second": 10, "source_packets_per_second": 15,
+        "icmp_packets_per_second": 10,
         "http_long_lived_connections": 30, "http_incomplete_connections": 20,
     }
 
@@ -39,7 +39,7 @@ def test_udp_and_icmp_use_their_own_source_counters():
 
 def test_incident_deduplication_scoped_resolution_and_recurrence(tmp_path):
     db = Database(tmp_path / "incidents.sqlite3")
-    config = {"thresholds": thresholds(), "mitigation": {"dry_run": True, "source_packets_per_second": 15}}
+    config = {"thresholds": thresholds(), "mitigation": {"dry_run": True}}
     service = DetectorService(config, db)
     attack = TrafficWindow(timestamp="2026-01-01T00:00:00+00:00", duration_seconds=1,
         syn_packets=12, top_source_ip="192.0.2.10",

@@ -13,7 +13,7 @@ from mitigation.unblock_scheduler import UnblockScheduler
 from storage.database import Database
 
 T = {"syn_packets_per_second": 250, "syn_completion_rate_max": 0.2, "udp_packets_per_second": 500,
-     "udp_bytes_per_second": 500000, "icmp_packets_per_second": 250, "source_packets_per_second": 150}
+     "udp_bytes_per_second": 500000, "icmp_packets_per_second": 250}
 
 
 def attack(ts, ip="9.9.9.9", rate=300):
@@ -32,9 +32,8 @@ def make_service(tmp_path, mitigation=None, capture=None, name="v4.sqlite3"):
 
 
 # ---- detector ---------------------------------------------------------------
-def test_missing_source_threshold_uses_default_instead_of_crashing():
-    thresholds = {k: v for k, v in T.items() if k != "source_packets_per_second"}
-    result = ThresholdDetector(thresholds).evaluate(TrafficWindow(source_stats={"192.0.2.1": {"packets": 5}}))
+def test_normal_packet_count_does_not_trigger_generic_detection():
+    result = ThresholdDetector(T).evaluate(TrafficWindow(source_stats={"192.0.2.1": {"packets": 5000}}))
     assert result.detected is False
 
 
@@ -50,10 +49,9 @@ def test_every_offending_source_is_reported_strongest_rule_first():
         ("1.1.1.1", "TCP SYN flood"), ("2.2.2.2", "TCP SYN flood"), ("3.3.3.3", "UDP flood")]
 
 
-def test_trusted_server_responses_do_not_trigger_generic_flood_alert():
+def test_high_packet_count_without_protocol_threshold_does_not_alert():
     window = TrafficWindow(duration_seconds=1, source_stats={"192.0.2.1": {"packets": 5000}})
-    assert ThresholdDetector(T, generic_exempt={"192.0.2.1"}).evaluate_all(window) == []
-    assert ThresholdDetector(T).evaluate_all(window)[0].attack_type == "Source packet flood"
+    assert ThresholdDetector(T).evaluate_all(window) == []
 
 
 # ---- service: re-block, escalation, concurrency, resolution --------------------

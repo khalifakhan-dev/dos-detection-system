@@ -27,9 +27,7 @@ class DetectorService:
         self.capture = PacketCapture(capture_cfg.get("interface", "auto"), 1.0,
                                      float(threshold_cfg.get("http_connection_age_seconds", 30)),
                                      tuple(capture_cfg.get("http_ports", [80])), capture_cfg.get("bpf_filter", "ip"))
-        # The protected server's own responses look like a high-rate source; exempt it (and
-        # other trusted hosts) from the generic packet-rate rule only.
-        self.detector = ThresholdDetector(threshold_cfg, generic_exempt=self.policy.trusted_ips)
+        self.detector = ThresholdDetector(threshold_cfg)
         self.nftables = NftablesManager(bool(mitigation_cfg.get("dry_run", True)))
         self.scheduler = UnblockScheduler(database, self.nftables, on_expire=self._on_block_expired)
         self._thread: threading.Thread | None = None
