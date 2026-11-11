@@ -3,7 +3,7 @@ from mitigation.block_policy import BlockPolicy
 
 
 def config():
-    return {"capture": {"protected_ip": "192.0.2.1"}, "mitigation": {"trusted_ips": ["192.0.2.2"], "default_quarantine_seconds": 300, "escalation_quarantine_seconds": 900, "repeated_detection_limit": 2}}
+    return {"capture": {"protected_ip": "192.0.2.1"}, "mitigation": {"trusted_ips": ["192.0.2.2"], "default_quarantine_seconds": 300}}
 
 
 def test_temporary_block():
@@ -13,7 +13,7 @@ def test_temporary_block():
     assert block["expires_at"] is not None
 
 
-def test_repeated_detection_escalates():
+def test_repeated_detection_does_not_escalate():
     result = DetectionResult(True, "UDP flood", "high", "192.0.2.50", "test")
     block = BlockPolicy(config()).decide(result, previous_count=1)
     assert block["mode"] == "temporary"

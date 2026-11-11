@@ -15,8 +15,6 @@ class BlockPolicy:
     def __init__(self, config: dict[str, Any]):
         mitigation = config.get("mitigation", {})
         self.default_seconds = int(mitigation.get("default_quarantine_seconds", 300))
-        self.escalation_seconds = int(mitigation.get("escalation_quarantine_seconds", 900))
-        self.repeated_limit = int(mitigation.get("repeated_detection_limit", 2))
         self.trusted_ips = {str(ipaddress.ip_address(ip)) for ip in mitigation.get("trusted_ips", [])}
         protected_ip = config.get("capture", {}).get("protected_ip", "")
         if protected_ip:
@@ -33,9 +31,8 @@ class BlockPolicy:
         if source_ip in self.trusted_ips:
             return None
         now = datetime.now(timezone.utc)
-        escalated = previous_count + 1 >= self.repeated_limit
         mode = "permanent" if permanent else "temporary"
-        duration = self.escalation_seconds if escalated else self.default_seconds
+        duration = self.default_seconds
         return {"ip": source_ip, "mode": mode, "status": "active", "reason": result.reason,
                 "attack_type": result.attack_type, "created_at": utc_now_iso(),
                 "expires_at": None if mode == "permanent" else (now + timedelta(seconds=duration)).isoformat(),

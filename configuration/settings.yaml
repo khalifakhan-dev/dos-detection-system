@@ -1,7 +1,7 @@
 capture:
   interface: "auto"
   protected_ip: ""
-  # Plaintext HTTP ports inspected for Slowloris. 443 is deliberately not listed:
+  # Plaintext HTTP ports inspected for incomplete HTTP headers. 443 is deliberately not listed:
   # TLS payloads are encrypted, so incomplete-header detection cannot work there.
   http_ports: [80]
   bpf_filter: "ip"          # IPv4 only; "" disables the kernel filter (needs tcpdump installed)
@@ -17,12 +17,9 @@ storage:
 mitigation:
   dry_run: true
   default_quarantine_seconds: 300
-  repeated_detection_window_seconds: 600
-  repeated_detection_limit: 2
   mitigation_retry_cooldown_seconds: 60
   incident_inactivity_timeout_seconds: 30
   manual_unblock_grace_seconds: 60
-  escalation_quarantine_seconds: 900
   trusted_ips: []
 
 thresholds:

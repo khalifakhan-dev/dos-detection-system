@@ -9,7 +9,7 @@ from typing import Any
 import customtkinter as ctk
 
 from dashboard.api_client import ApiClient
-from dashboard.time_format import format_for_display, format_timestamp
+from dashboard.time_format import format_timestamp
 
 
 class Dashboard(ctk.CTk):
@@ -22,6 +22,9 @@ class Dashboard(ctk.CTk):
         self.refresh_ms = 2000
         self._refresh_in_progress = False
         self._closing = False
+        self._shown_alerts: set[tuple[str, str]] = set()
+        self._popup: ctk.CTkToplevel | None = None
+        self._popup_key: tuple[str, str] | None = None
         self._poll_timer = None
         self._queue_timer = None
         self._build_ui()
@@ -45,28 +48,26 @@ class Dashboard(ctk.CTk):
         tabs = ctk.CTkTabview(self)
         tabs.grid(row=2, column=0, padx=12, pady=8, sticky="nsew")
         tabs.add("Active Incidents")
-        tabs.add("Historical Alerts")
         tabs.add("Active Blocks")
-        tabs.add("Events")
-        for name in ("Active Incidents", "Historical Alerts", "Active Blocks", "Events"):
+        for name in ("Active Incidents", "Active Blocks"):
             tabs.tab(name).grid_rowconfigure(0, weight=1)
             tabs.tab(name).grid_columnconfigure(0, weight=1)
         self.incidents_box = ctk.CTkTextbox(tabs.tab("Active Incidents"), font=("Consolas", 12))
         self.incidents_box.grid(row=0, column=0, padx=8, pady=8, sticky="nsew")
-        self.alerts_box = ctk.CTkTextbox(tabs.tab("Historical Alerts"), font=("Consolas", 12))
-        self.alerts_box.grid(row=0, column=0, padx=8, pady=8, sticky="nsew")
         self.blocks_box = ctk.CTkTextbox(tabs.tab("Active Blocks"), font=("Consolas", 12))
         self.blocks_box.grid(row=0, column=0, padx=8, pady=8, sticky="nsew")
-        self.events_box = ctk.CTkTextbox(tabs.tab("Events"), font=("Consolas", 12))
-        self.events_box.grid(row=0, column=0, padx=8, pady=8, sticky="nsew")
 
         controls = ctk.CTkFrame(self)
         controls.grid(row=3, column=0, padx=12, pady=8, sticky="ew")
+        self.mode_label = ctk.CTkLabel(controls, text="Mitigation: MANUAL", font=ctk.CTkFont(weight="bold"))
+        self.mode_label.grid(row=0, column=0, padx=8, pady=8)
+        self.mode_switch = ctk.CTkSwitch(controls, text="Automatic mode", command=self._toggle_mode)
+        self.mode_switch.grid(row=0, column=1, padx=8, pady=8)
         self.ip_entry = ctk.CTkEntry(controls, placeholder_text="IPv4 address")
-        self.ip_entry.grid(row=0, column=0, padx=8, pady=8)
-        ctk.CTkButton(controls, text="Unblock IP", command=self.unblock_ip).grid(row=0, column=1, padx=8, pady=8)
-        ctk.CTkButton(controls, text="Permanent Block", command=self.permanent_block).grid(row=0, column=2, padx=8, pady=8)
-        ctk.CTkButton(controls, text="Refresh Now", command=self.refresh).grid(row=0, column=3, padx=8, pady=8)
+        self.ip_entry.grid(row=1, column=0, padx=8, pady=8)
+        ctk.CTkButton(controls, text="Unblock IP", command=self.unblock_ip).grid(row=1, column=1, padx=8, pady=8)
+        ctk.CTkButton(controls, text="Permanent Block", command=self.permanent_block).grid(row=1, column=2, padx=8, pady=8)
+        ctk.CTkButton(controls, text="Refresh Now", command=self.refresh).grid(row=1, column=3, padx=8, pady=8)
 
     def _poll(self) -> None:
         if self._closing:
@@ -89,7 +90,7 @@ class Dashboard(ctk.CTk):
 
     def _load_data(self) -> None:
         try:
-            self.queue.put(("data", {"status": self.client.status(), "metrics": self.client.metrics(), "incidents": self.client.incidents(active_only=True), "alerts": self.client.alerts(), "blocks": self.client.blocks(), "events": self.client.events()}))
+            self.queue.put(("data", {"status": self.client.status(), "incidents": self.client.incidents(active_only=True), "blocks": self.client.blocks(), "live_alerts": self.client.live_alerts()}))
         except Exception as exc:
             self.queue.put(("error", str(exc)))
         finally:
@@ -99,7 +100,13 @@ class Dashboard(ctk.CTk):
         try:
             while True:
                 kind, payload = self.queue.get_nowait()
-                if kind == "action":
+                if kind == "mode":
+                    if payload[1]:
+                        messagebox.showerror("Mode change failed", payload[1])
+                        self.refresh()
+                    else:
+                        self.refresh()
+                elif kind == "action":
                     action, ip, result, error = payload
                     if error:
                         messagebox.showerror(f"{action} failed", error)
@@ -121,7 +128,13 @@ class Dashboard(ctk.CTk):
         capture_state = health.get("state", "UNKNOWN")
         self.status_label.configure(text=f"Connected | capture={capture_state} | dry-run={status.get('dry_run')}",
                                     text_color="#d9534f" if capture_state == "ERROR" else "#2e8b57")
-        window = status.get("latest_window") or (data["metrics"][-1] if data["metrics"] else {})
+        mode = status.get("mitigation_mode", "manual")
+        self.mode_label.configure(text=f"Mitigation: {mode.upper()}")
+        if mode == "automatic":
+            self.mode_switch.select()
+        else:
+            self.mode_switch.deselect()
+        window = status.get("latest_window") or {}
         detection = status.get("latest_detection", {})
         self.metrics_label.configure(text=(
             f"Packets/s: {window.get('total_packets', 0)}    Bytes/s: {window.get('total_bytes', 0)}    "
@@ -130,9 +143,61 @@ class Dashboard(ctk.CTk):
             f"Latest detection: {detection.get('attack_type') or 'Normal'}    Source: {detection.get('source_ip') or '-'}    Reason: {detection.get('reason') or '-'}"
         ))
         self._replace(self.incidents_box, "\n".join(self._format_incident(row) for row in data["incidents"]) or "No active incidents.")
-        self._replace(self.alerts_box, "\n".join(self._format_alert(row) for row in data["alerts"]) or "No historical alerts recorded.")
         self._replace(self.blocks_box, "\n".join(self._format_block(row) for row in data["blocks"]) or "No active blocks.")
-        self._replace(self.events_box, "\n".join(str(format_for_display(row)) for row in data.get("events", [])) or "No events recorded.")
+        alerts = data.get("live_alerts", [])
+        keys = {(a.get("source_ip"), a.get("attack_type")) for a in alerts}
+        self._shown_alerts.intersection_update(keys)
+        if self._popup is None or not self._popup.winfo_exists():
+            for alert in alerts:
+                key = (alert.get("source_ip"), alert.get("attack_type"))
+                if key not in self._shown_alerts and key[0]:
+                    self._shown_alerts.add(key)
+                    self._show_alert_popup(alert)
+                    break
+
+
+    def _toggle_mode(self) -> None:
+        new_mode = "automatic" if self.mode_switch.get() else "manual"
+        if new_mode == "automatic" and not messagebox.askyesno(
+            "Enable automatic mitigation?",
+            "Automatically block detected attacking IPs for 5 minutes?\n"
+            "Dry-run mode will only simulate blocks."):
+            self.mode_switch.deselect()
+            return
+        def worker() -> None:
+            try:
+                self.client.set_mode(new_mode)
+                self.queue.put(("mode", (new_mode, None)))
+            except Exception as exc:
+                self.queue.put(("mode", (new_mode, str(exc))))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_alert_popup(self, alert: dict[str, Any]) -> None:
+        ip, attack_type = alert["source_ip"], alert["attack_type"]
+        self._popup_key = (ip, attack_type)
+        popup = ctk.CTkToplevel(self)
+        self._popup = popup
+        popup.title("Potential attack detected")
+        popup.geometry("520x345")
+        popup.transient(self)  # Non-modal: the dashboard continues refreshing.
+        popup.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(popup, text="POTENTIAL ATTACK DETECTED", font=ctk.CTkFont(size=19, weight="bold"), text_color="#f59e0b").grid(row=0, column=0, padx=18, pady=(18, 8))
+        details = (f"Attack: {attack_type}\nSource IP: {ip}\nSeverity: {alert.get('severity', '-')}\n"
+                   f"Reason: {alert.get('reason', '-')}\nObserved: {alert.get('observed', {})}\n"
+                   f"Threshold: {alert.get('threshold', {})}")
+        ctk.CTkLabel(popup, text=details, justify="left", wraplength=475).grid(row=1, column=0, padx=18, pady=12, sticky="w")
+        buttons = ctk.CTkFrame(popup)
+        buttons.grid(row=2, column=0, pady=12)
+        def take_action(action: str) -> None:
+            popup.destroy()
+            self._popup = None
+            if action == "block":
+                self._admin_action("Permanent block", ip, lambda: self.client.permanent_block(ip))
+            else:
+                self._admin_action("Ignore alert", ip, lambda: self.client.ignore_alert(ip, attack_type))
+        ctk.CTkButton(buttons, text="Block IP", fg_color="#b91c1c", command=lambda: take_action("block")).grid(row=0, column=0, padx=10, pady=10)
+        ctk.CTkButton(buttons, text="Ignore", command=lambda: take_action("ignore")).grid(row=0, column=1, padx=10, pady=10)
+        popup.protocol("WM_DELETE_WINDOW", lambda: take_action("ignore"))
 
     @staticmethod
     def _replace(widget: ctk.CTkTextbox, text: str) -> None:

@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -35,10 +34,11 @@ class DetectorService:
         self._lock = threading.RLock()
         self._latest_window: dict[str, Any] = {}
         self._latest_result: dict[str, Any] = {"detected": False}
-        self._block_history: dict[str, deque[float]] = defaultdict(deque)   # automatic blocks per IP (for escalation)
-        self._mitigation_failures: dict[tuple[str, str], float] = {}       # failed attempts only (retry cooldown)
         self._manual_unblocks: dict[str, float] = {}
         self._mitigation_attempts: dict[int, dict[str, Any]] = {}
+        # Mode and notifications are runtime state; DB remains for internal audit only.
+        self._mode = "manual"
+        self._live_alerts: dict[tuple[str, str], dict[str, Any]] = {}
         self._last_prune = 0.0
         self._mitigation_ready = self.nftables.dry_run
         self._ruleset_result: dict[str, Any] = {"success": self.nftables.dry_run, "dry_run": self.nftables.dry_run}
@@ -100,6 +100,12 @@ class DetectorService:
         with self._lock:
             self._latest_window, self._latest_result = stored, primary.to_dict()
         self.database.add_metric(stored)
+        with self._lock:
+            now = time.monotonic()
+            timeout = float(self.config.get("mitigation", {}).get("incident_inactivity_timeout_seconds", 30))
+            for key in list(self._live_alerts):
+                if now - self._live_alerts[key]["_last_seen"] > timeout:
+                    del self._live_alerts[key]
         for result in results:
             self._handle_detection(window, result)
         self._resolve_incidents(window, results)
@@ -143,30 +149,34 @@ class DetectorService:
             self.database.add_alert(result_dict, timestamp)
         self.database.add_event("detection", {"outcome": "detection", "result": result_dict}, result.source_ip, timestamp)
         if not result.source_ip:
+            return  # Never block unattributed aggregate traffic.
+        key = (result.source_ip, result.attack_type or "unknown")
+        with self._lock:
+            previous_alert = self._live_alerts.get(key, {})
+            self._live_alerts[key] = {
+                **result_dict, "timestamp": timestamp,
+                "ignored": previous_alert.get("ignored", False),
+                "_last_seen": time.monotonic(),
+            }
+            mode = self._mode
+        if mode != "automatic":
+            return  # Manual mode NEVER blocks without administrator approval.
+        if not self._mitigation_ready or self.policy.is_trusted(result.source_ip):
             return
-        if not self._mitigation_ready:
-            self.database.add_event("mitigation_not_ready", {"outcome": "not_ready", "ruleset": self._ruleset_result}, result.source_ip, timestamp)
+        if time.time() - self._manual_unblocks.get(result.source_ip, float("-inf")) < float(self.config.get("mitigation", {}).get("manual_unblock_grace_seconds", 60)):
             return
-        mitigation_cfg = self.config.get("mitigation", {})
-        if time.time() - self._manual_unblocks.get(result.source_ip, float("-inf")) < float(mitigation_cfg.get("manual_unblock_grace_seconds", 60)):
-            self.database.add_event("mitigation_skipped", {"outcome": "idempotent_skip", "reason": "administrator recently unblocked this source"}, result.source_ip, timestamp)
+        if self.database.has_active_block(result.source_ip):
             return
         incident = self.database.active_incident(result.source_ip, result.attack_type or "unknown")
         if not incident:
             return
         identity = int(incident["id"])
         now_wall = time.time()
-        previous = getattr(self, "_mitigation_attempts", {}).get(identity)
-        retry_seconds = float(mitigation_cfg.get("mitigation_retry_cooldown_seconds", 60))
-        block_expired = previous and previous.get("expires_at") and datetime.fromisoformat(previous["expires_at"]) <= datetime.now(timezone.utc)
-        active_block = self.database.has_active_block(result.source_ip)
-        if previous and not block_expired and ((previous.get("success") and active_block) or (not previous.get("success") and now_wall - previous["attempted_at"] < retry_seconds)):
-            self.database.add_event("mitigation_skipped", {"outcome": "idempotent_skip", "reason": "active incident already mitigated or retry cooldown not elapsed", "cooldown_seconds": retry_seconds}, result.source_ip, timestamp)
+        previous = self._mitigation_attempts.get(identity)
+        retry_seconds = float(self.config.get("mitigation", {}).get("mitigation_retry_cooldown_seconds", 60))
+        if previous and not previous.get("success") and now_wall - previous["attempted_at"] < retry_seconds:
             return
-        repeat_window = float(mitigation_cfg.get("repeated_detection_window_seconds", 600))
-        recurrence_since = self._timestamp_minus(timestamp, repeat_window)
-        previous_count = self.database.recent_incident_count(result.source_ip, result.attack_type or "unknown", recurrence_since) if created else (1 if previous and previous.get("success") and not active_block else 0)
-        block = self.policy.decide(result, previous_count)
+        block = self.policy.decide(result)  # Fixed 5-minute quarantine; no escalation.
         if not block:
             return
         self.database.add_event("mitigation_attempt", {"outcome": "mitigation_attempt", "block": block}, block["ip"], timestamp)
@@ -179,6 +189,34 @@ class DetectorService:
             block["updated_at"], block["dry_run"] = utc_now_iso(), nft_result["simulated"]
             self.database.upsert_block(block)
         logger.warning("Detected %s from %s; mitigation=%s", result.attack_type, result.source_ip, nft_result)
+
+    def mitigation_mode(self) -> str:
+        with self._lock:
+            return self._mode
+
+    def set_mitigation_mode(self, mode: str) -> dict[str, Any]:
+        if mode not in ("manual", "automatic"):
+            raise ValueError("Mode must be manual or automatic")
+        with self._lock:
+            self._mode = mode
+        self.database.add_event("mitigation_mode", {"mode": mode}, None, utc_now_iso())
+        return {"mode": mode, "success": True}
+
+    def live_alerts(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [{k: v for k, v in alert.items() if not k.startswith("_")}
+                    for alert in self._live_alerts.values() if not alert.get("ignored")]
+
+    def ignore_alert(self, ip: str, attack_type: str) -> dict[str, Any]:
+        ip = NftablesManager.validate_ip(ip)
+        with self._lock:
+            key = (ip, attack_type)
+            if key not in self._live_alerts:
+                raise ValueError("Alert is no longer active")
+            self._live_alerts[key]["ignored"] = True
+        self.database.add_event("alert_ignored", {"attack_type": attack_type}, ip, utc_now_iso())
+        return {"success": True, "ip": ip, "attack_type": attack_type}
+
     @staticmethod
     def _duration(block: dict[str, Any]) -> int | None:
         if not block.get("expires_at"):
@@ -187,7 +225,7 @@ class DetectorService:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
-            return {"started_at": self.started_at, "capture_running": bool(self._thread and self._thread.is_alive()), "capture_health": self.capture.health(), "dry_run": self.nftables.dry_run, "mitigation_ready": self._mitigation_ready, "ruleset_result": self._ruleset_result, "latest_window": self._latest_window, "latest_detection": self._latest_result}
+            return {"started_at": self.started_at, "capture_running": bool(self._thread and self._thread.is_alive()), "capture_health": self.capture.health(), "dry_run": self.nftables.dry_run, "mitigation_ready": self._mitigation_ready, "ruleset_result": self._ruleset_result, "latest_window": self._latest_window, "latest_detection": self._latest_result, "mitigation_mode": self._mode}
 
     @staticmethod
     def _timestamp_minus(timestamp: str, seconds: float) -> str:
@@ -220,6 +258,8 @@ class DetectorService:
         if self.policy.is_trusted(ip):
             raise ProtectedAddressError(f"{ip} is a trusted/protected address and cannot be blocked")
         now = utc_now_iso()
+        if not self._mitigation_ready:
+            raise ValueError("Mitigation firewall is not ready")
         result = self._record_action("permanent_block", self.nftables.block(ip), ip, now)
         if result.get("success"):
             self._manual_unblocks.pop(ip, None)

@@ -28,13 +28,13 @@ def _attack(timestamp, source="192.0.2.10"):
 def test_repeated_incident_calls_block_once(tmp_path):
     db = Database(tmp_path / "idempotent.sqlite3")
     service = DetectorService({"thresholds": _thresholds(), "mitigation": {"dry_run": True}}, db)
+    service.set_mitigation_mode("automatic")
     calls = []
     original = service.nftables.block
     service.nftables.block = lambda ip, timeout: (calls.append(ip) or original(ip, timeout))
     service.process_window(_attack("2026-01-01T00:00:00+00:00"))
     service.process_window(_attack("2026-01-01T00:00:01+00:00"))
     assert calls == ["192.0.2.10"]
-    assert db.events(10)[0]["event_type"] == "mitigation_skipped"
     db.close()
 
 

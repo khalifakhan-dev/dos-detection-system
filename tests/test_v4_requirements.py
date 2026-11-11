@@ -55,32 +55,36 @@ def test_recent_unrelated_active_incident_survives_timeout_check(tmp_path):
     db.close()
 
 
-def test_new_incident_gets_new_mitigation_attempt_and_recurrence_escalates(tmp_path):
+def test_new_incident_uses_same_quarantine_without_escalation(tmp_path):
     db = Database(tmp_path / "recurrence.sqlite3")
     config = {"thresholds": thresholds(), "mitigation": {"dry_run": True, "incident_inactivity_timeout_seconds": 5, "default_quarantine_seconds": 30, "escalation_quarantine_seconds": 90, "repeated_detection_window_seconds": 600}}
     service = DetectorService(config, db)
+    service.set_mitigation_mode("automatic")
     source = "192.0.2.20"
+    service.set_mitigation_mode("automatic")
     calls = []
     original = service.nftables.block
     service.nftables.block = lambda ip, timeout: (calls.append(timeout) or original(ip, timeout))
     service.process_window(syn("2026-01-01T00:00:00+00:00", source))
     service.process_window(TrafficWindow(timestamp="2026-01-01T00:00:01+00:00", source_stats={source: {"packets": 1}}))
+    db.update_block_status(source, "expired", "2026-01-01T00:00:01+00:00")
     service.process_window(syn("2026-01-01T00:00:02+00:00", source))
     assert len(calls) == 2
-    assert calls[1] > calls[0]
+    assert calls[1] == calls[0]
     db.close()
 
 
 def test_same_incident_different_attack_types_are_independently_idempotent(tmp_path):
     db = Database(tmp_path / "types.sqlite3")
     service = DetectorService({"thresholds": thresholds(), "mitigation": {"dry_run": True}}, db)
+    service.set_mitigation_mode("automatic")
     calls = []
     original = service.nftables.block
     service.nftables.block = lambda ip, timeout: (calls.append(ip) or original(ip, timeout))
     service.process_window(syn("2026-01-01T00:00:00+00:00", "192.0.2.30"))
     service.process_window(udp("2026-01-01T00:00:01+00:00", "192.0.2.30"))
     service.process_window(syn("2026-01-01T00:00:02+00:00", "192.0.2.30"))
-    assert calls == ["192.0.2.30", "192.0.2.30"]
+    assert calls == ["192.0.2.30"]  # one active IP block, regardless of attack type
     assert len(db.incidents(active_only=True)) == 2
     db.close()
 

@@ -19,6 +19,15 @@ runtime = Runtime()
 app = FastAPI(title="DoS Detection and Mitigation API", version="1.0.0")
 
 
+class ModeRequest(BaseModel):
+    mode: str
+
+
+class IgnoreRequest(BaseModel):
+    ip: str
+    attack_type: str
+
+
 class ActionRequest(BaseModel):
     reason: str = "Dashboard administrator action"
 
@@ -105,3 +114,19 @@ def permanent(ip: str, request: ActionRequest | None = None, _: None = Depends(r
 @app.post("/api/blocks/unblock-all")
 def unblock_all(_: None = Depends(require_token)) -> dict[str, Any]:
     return _call(lambda: runtime.service.unblock_all())
+
+
+@app.get("/api/live-alerts")
+def live_alerts(_: None = Depends(require_token)) -> list[dict[str, Any]]:
+    return runtime.service.live_alerts() if runtime.service else []
+
+
+@app.post("/api/mitigation/mode")
+def change_mode(request: ModeRequest, _: None = Depends(require_token)) -> dict[str, Any]:
+    return _call(lambda: runtime.service.set_mitigation_mode(request.mode))
+
+
+@app.post("/api/live-alerts/ignore")
+def ignore_alert(request: IgnoreRequest, _: None = Depends(require_token)) -> dict[str, Any]:
+    address = valid_ip(request.ip)
+    return _call(lambda: runtime.service.ignore_alert(address, request.attack_type))

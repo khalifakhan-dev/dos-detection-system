@@ -40,3 +40,12 @@ class ApiClient:
 
     def permanent_block(self, ip: str) -> dict[str, Any]:
         return self._request("POST", f"/api/blocks/{ip}/permanent", json={"reason": "Windows dashboard administrator action"})
+
+    def live_alerts(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/api/live-alerts")
+
+    def set_mode(self, mode: str) -> dict[str, Any]:
+        return self._request("POST", "/api/mitigation/mode", json={"mode": mode})
+
+    def ignore_alert(self, ip: str, attack_type: str) -> dict[str, Any]:
+        return self._request("POST", "/api/live-alerts/ignore", json={"ip": ip, "attack_type": attack_type})

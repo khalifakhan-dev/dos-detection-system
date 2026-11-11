@@ -25,6 +25,7 @@ def make_service(tmp_path, mitigation=None, capture=None, name="v4.sqlite3"):
     db = Database(tmp_path / name)
     cfg = {"thresholds": dict(T), "mitigation": {"dry_run": True, **(mitigation or {})}, "capture": capture or {}}
     service = DetectorService(cfg, db)
+    service.set_mitigation_mode("automatic")
     calls = []
     original = service.nftables.block
     service.nftables.block = lambda ip, timeout: (calls.append((ip, timeout)) or original(ip, timeout))
@@ -55,14 +56,14 @@ def test_high_packet_count_without_protocol_threshold_does_not_alert():
 
 
 # ---- service: re-block, escalation, concurrency, resolution --------------------
-def test_attacker_is_reblocked_with_escalated_duration_after_expiry(tmp_path):
+def test_attacker_is_reblocked_with_fixed_duration_after_expiry(tmp_path):
     service, db, calls = make_service(tmp_path)
     service.process_window(attack("2026-01-01T00:00:00+00:00"))
     db.update_block_status("9.9.9.9", "expired", "x")          # what the scheduler does at expiry
     service.process_window(attack("2026-01-01T00:10:00+00:00"))
     assert [ip for ip, _ in calls] == ["9.9.9.9", "9.9.9.9"]
     assert 290 <= calls[0][1] <= 300
-    assert 890 <= calls[1][1] <= 900                           # escalated quarantine
+    assert 290 <= calls[1][1] <= 300                           # no escalation
     assert len(db.alerts()) == 1                               # same incident, no duplicate alert
     db.close()
 
@@ -93,7 +94,6 @@ def test_recently_unblocked_source_is_not_instantly_reblocked(tmp_path):
     service.manual_unblock("9.9.9.9")
     service.process_window(attack("2026-01-01T00:00:01+00:00"))
     assert len(calls) == 1
-    assert db.events(1)[0]["event_type"] == "mitigation_skipped"
     db.close()
 
 
