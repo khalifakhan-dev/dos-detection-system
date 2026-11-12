@@ -77,6 +77,14 @@ class DetectorService:
         for block in self.database.blocks(active_only=True):
             ip = block["ip"]
             try:
+                # Trusted/protected addresses must never be restored from persisted blocks.
+                # Configuration may have changed since a real block was recorded.
+                if self.policy.is_trusted(ip):
+                    timestamp = utc_now_iso()
+                    self.database.update_block_status(ip, "protected_skipped", timestamp)
+                    self.database.add_event("mitigation_skipped", {"action": "reconcile", "reason": "trusted_or_protected_address"}, ip, timestamp)
+                    logger.warning("Skipped reconciliation of trusted/protected address %s", ip)
+                    continue
                 if block.get("dry_run"):  # created by an earlier simulation: never enforce it for real
                     self.database.update_block_status(ip, "simulation_ended", utc_now_iso())
                     continue
