@@ -214,13 +214,22 @@ class Dashboard(ctk.CTk):
                         messagebox.showerror('Mode change failed', payload)
                     self.refresh()
                 elif kind == 'action':
-                    action, ip, result, error = payload
+                    action, ip, result, error, popup_key = payload
+                    if popup_key and not error and result and result.get('success'):
+                        if self._popup_key == popup_key:
+                            self._dismiss_popup()
                     if error:
                         messagebox.showerror(f'{action} failed', error)
+                        if popup_key and self._popup_key == popup_key:
+                            for button in self._popup_buttons:
+                                button.configure(state='normal')
                     elif result.get('expired'):
                         pass  # Stale alert was already resolved; not an operational failure.
                     elif not result.get('success'):
                         messagebox.showerror(f'{action} failed', str(result.get('error') or result.get('stderr') or 'Server rejected action'))
+                        if popup_key and self._popup_key == popup_key:
+                            for button in self._popup_buttons:
+                                button.configure(state='normal')
                     elif result.get('simulated') or result.get('dry_run'):
                         messagebox.showwarning('Simulation only', f'{action}: {ip}\nNo firewall changes were made.')
                     else:
@@ -273,11 +282,16 @@ class Dashboard(ctk.CTk):
         self._replace(self.incidents_box, '\n'.join(f"{r.get('attack_type')}  |  {r.get('source_ip') or 'uncertain'}\n  last: {format_timestamp(r.get('last_seen'))}" for r in incidents) or 'No active incidents.')
         blocks = data['blocks']
         self._replace(self.blocks_box, '\n'.join(f"{r.get('ip')}  |  {'SIMULATED' if r.get('dry_run') else 'REAL BLOCK'}  |  {r.get('mode')}  |  expires: {format_timestamp(r.get('expires_at')) if r.get('expires_at') else 'manual unblock'}" for r in blocks) or 'No active blocks.')
-        alerts = data.get('alerts') or []
+        blocked_ips = {row.get('ip') for row in blocks}
+        alerts = [a for a in (data.get('alerts') or []) if a.get('source_ip') not in blocked_ips]
         keys = {(a.get('source_ip'), a.get('attack_type')) for a in alerts}
         self._seen.intersection_update(keys)
         if self._popup and self._popup.winfo_exists() and self._popup_key not in keys:
-            self._dismiss_popup()
+            self._dismiss_popup()  # Explicitly resolved elsewhere, blocked, or mode changed.
+        if self._popup and self._popup.winfo_exists() and self._popup_key in keys:
+            current = next(a for a in alerts if (a.get('source_ip'), a.get('attack_type')) == self._popup_key)
+            self._popup_state.configure(text='● ATTACK ONGOING' if current.get('ongoing', True) else '● ATTACK ENDED — decision still pending',
+                                        text_color=RED if current.get('ongoing', True) else AMBER)
         if mode == 'automatic':
             if self._popup and self._popup.winfo_exists():
                 self._dismiss_popup()
@@ -302,7 +316,7 @@ class Dashboard(ctk.CTk):
         pop = ctk.CTkToplevel(self, fg_color=PANEL)
         self._popup = pop
         pop.title('Sentinel | Potential attack')
-        pop.geometry('530x370')
+        pop.geometry('530x420')
         pop.transient(self)
         pop.grid_columnconfigure(0, weight=1)
         self._label(pop, '⚠  POTENTIAL ATTACK DETECTED', 20, AMBER, True).grid(row=0, column=0, padx=20, pady=(22, 12), sticky='w')
@@ -318,16 +332,25 @@ class Dashboard(ctk.CTk):
         self._replace(box, '\n'.join(lines))
         buttons = ctk.CTkFrame(pop, fg_color='transparent')
         buttons.grid(row=2, column=0, pady=14)
+        self._popup_state = self._label(pop, '● ATTACK ONGOING', 12, RED, True)
+        self._popup_state.grid(row=3, column=0, padx=18, pady=(0, 3), sticky='w')
+        self._label(pop, 'Pending until Block, Ignore or Close (Close = Ignore)', 11, MUTED).grid(row=4, column=0, padx=18, pady=(0, 8), sticky='w')
         def action(block: bool) -> None:
-            self._dismiss_popup()
+            if block and not messagebox.askyesno('Confirm manual block', f'Block {ip} until manually unblocked?'):
+                return  # A cancelled confirmation must not discard the alert.
+            block_button.configure(state='disabled')
+            ignore_button.configure(state='disabled')
             if block:
-                if messagebox.askyesno('Confirm manual block', f'Block {ip} until manually unblocked?'):
-                    self._run_action('Block IP', ip, lambda: self.client.permanent_block(ip))
+                self._run_action('Block IP', ip, lambda: self.client.permanent_block(ip), popup_key=(ip, attack_type))
             else:
-                self._run_action('Ignore alert', ip, lambda: self.client.ignore_alert(ip, attack_type))
-        ctk.CTkButton(buttons, text='Block IP', fg_color='#b91c1c', command=lambda: action(True)).pack(side='left', padx=10)
-        ctk.CTkButton(buttons, text='Ignore', command=lambda: action(False)).pack(side='left', padx=10)
-        pop.protocol('WM_DELETE_WINDOW', self._dismiss_popup)
+                self._run_action('Ignore alert', ip, lambda: self.client.ignore_alert(ip, attack_type), popup_key=(ip, attack_type))
+        block_button = ctk.CTkButton(buttons, text='Block IP', fg_color='#b91c1c', command=lambda: action(True))
+        block_button.pack(side='left', padx=10)
+        ignore_button = ctk.CTkButton(buttons, text='Ignore', command=lambda: action(False))
+        ignore_button.pack(side='left', padx=10)
+        # Closing the window is an explicit dismissal, equivalent to Ignore.
+        pop.protocol('WM_DELETE_WINDOW', lambda: action(False))
+        self._popup_buttons = (block_button, ignore_button)
 
     def _toggle(self) -> None:
         mode = 'automatic' if self.mode_switch.get() else 'manual'
@@ -343,12 +366,12 @@ class Dashboard(ctk.CTk):
                 self.queue.put(('mode', str(exc)))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _run_action(self, action: str, ip: str, fn: Any) -> None:
+    def _run_action(self, action: str, ip: str, fn: Any, popup_key: tuple[str, str] | None = None) -> None:
         def worker() -> None:
             try:
-                self.queue.put(('action', (action, ip, fn(), None)))
+                self.queue.put(('action', (action, ip, fn(), None, popup_key)))
             except Exception as exc:
-                self.queue.put(('action', (action, ip, None, str(exc))))
+                self.queue.put(('action', (action, ip, None, str(exc), popup_key)))
         threading.Thread(target=worker, daemon=True).start()
 
     def _ip(self) -> str | None:

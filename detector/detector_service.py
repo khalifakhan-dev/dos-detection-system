@@ -104,8 +104,14 @@ class DetectorService:
             now = time.monotonic()
             timeout = float(self.config.get("mitigation", {}).get("incident_inactivity_timeout_seconds", 30))
             for key in list(self._live_alerts):
-                if now - self._live_alerts[key]["_last_seen"] > timeout:
-                    del self._live_alerts[key]
+                alert = self._live_alerts[key]
+                if now - alert["_last_seen"] > timeout:
+                    if alert.get("ignored"):
+                        # Acknowledged alerts may reappear only after a quiet period.
+                        del self._live_alerts[key]
+                    else:
+                        # An unanswered decision persists after traffic subsides.
+                        alert["ongoing"] = False
         for result in results:
             self._handle_detection(window, result)
         self._resolve_incidents(window, results)
@@ -154,14 +160,23 @@ class DetectorService:
             return  # Keep detection evidence in SQLite, but never offer trusted IPs for blocking.
         key = (result.source_ip, result.attack_type or "unknown")
         with self._lock:
-            previous_alert = self._live_alerts.get(key, {})
-            self._live_alerts[key] = {
-                **result_dict, "timestamp": timestamp,
-                "ignored": previous_alert.get("ignored", False),
-                "_last_seen": time.monotonic(),
-            }
             mode = self._mode
-        if mode != "automatic":
+            # Existing blocks still produce detection evidence, not new decisions.
+            blocked = self.database.has_active_block(result.source_ip)
+            if blocked:
+                self._clear_alerts_for_ip(result.source_ip)
+            elif mode == "manual":
+                previous_alert = self._live_alerts.get(key)
+                if previous_alert is None:
+                    self._live_alerts[key] = {
+                        **result_dict, "timestamp": timestamp, "ignored": False,
+                        "ongoing": True, "_last_seen": time.monotonic(),
+                    }
+                else:
+                    # Keep the original evidence and decision until acknowledged.
+                    previous_alert["_last_seen"] = time.monotonic()
+                    previous_alert["ongoing"] = True
+        if mode != "automatic" or blocked:
             return  # Manual mode NEVER blocks without administrator approval.
         if not self._mitigation_ready or self.policy.is_trusted(result.source_ip):
             return
@@ -201,8 +216,16 @@ class DetectorService:
             raise ValueError("Mode must be manual or automatic")
         with self._lock:
             self._mode = mode
+            if mode == "automatic":
+                self._live_alerts.clear()  # No pending manual decisions in auto mode.
         self.database.add_event("mitigation_mode", {"mode": mode}, None, utc_now_iso())
         return {"mode": mode, "success": True}
+
+    def _clear_alerts_for_ip(self, ip: str) -> None:
+        """Caller must hold _lock (RLock permits nested calls)."""
+        for key in list(self._live_alerts):
+            if key[0] == ip:
+                del self._live_alerts[key]
 
     def live_alerts(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -266,6 +289,8 @@ class DetectorService:
         if result.get("success"):
             self._manual_unblocks.pop(ip, None)
             self.database.upsert_block({"ip": ip, "mode": "permanent", "status": "active", "reason": reason, "attack_type": "manual", "created_at": now, "expires_at": None, "updated_at": now, "dry_run": result["simulated"]})
+            with self._lock:
+                self._clear_alerts_for_ip(ip)
         return result
 
     def unblock_all(self) -> dict[str, Any]:
