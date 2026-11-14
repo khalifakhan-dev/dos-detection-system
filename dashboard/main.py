@@ -69,12 +69,20 @@ class Dashboard(ctk.CTk):
     def __init__(self, client: ApiClient):
         super().__init__(fg_color=BG)
         self.client = client
-        self.title('Sentinel | DoS Detection & Mitigation')
+        self.title('DoS Detection and Mitigation System')
         self.geometry('1330x850')
+        try:
+            self.state('zoomed')  # Windows: open maximized.
+        except tk.TclError:
+            pass  # Other desktop environments retain the normal window size.
         self.minsize(1060, 720)
         self.queue: Queue[tuple[str, Any]] = Queue()
         self._closing = False
         self._busy = False
+        self._refresh_animation_id = None
+        self._refresh_frame = 0
+        self._refresh_manual = False
+        self._block_ips: list[str] = []
         self._poll_id = None
         self._queue_id = None
         self._popup: ctk.CTkToplevel | None = None
@@ -97,10 +105,9 @@ class Dashboard(ctk.CTk):
         head = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=12)
         head.grid(row=0, column=0, sticky='ew', padx=16, pady=(14, 8))
         head.grid_columnconfigure(0, weight=1)
-        self._label(head, '◈  SENTINEL   /   DoS Detection & Mitigation', 22, TEXT, True).grid(row=0, column=0, sticky='w', padx=20, pady=(14, 0))
-        self._label(head, 'LIVE SECURITY OPERATIONS  •  AUTHORIZED LAB MONITORING', 11, MUTED).grid(row=1, column=0, sticky='w', padx=20, pady=(0, 14))
+        self._label(head, 'DoS Detection and Mitigation System', 22, TEXT, True).grid(row=0, column=0, sticky='w', padx=20, pady=16)
         self.connection = self._label(head, 'CONNECTING', 12, AMBER, True)
-        self.connection.grid(row=0, column=1, rowspan=2, padx=20)
+        self.connection.grid(row=0, column=1, padx=20)
 
         body = ctk.CTkScrollableFrame(self, fg_color='transparent')
         body.grid(row=1, column=0, sticky='nsew', padx=10)
@@ -157,7 +164,13 @@ class Dashboard(ctk.CTk):
         blocks.grid_columnconfigure(0, weight=1)
         self._label(blocks, 'ACTIVE BLOCKS  •  simulated blocks are explicitly marked', 14, TEXT, True).grid(row=0, column=0, sticky='w', padx=14, pady=(12, 4))
         self.blocks_box = ctk.CTkTextbox(blocks, height=86, fg_color=INNER, text_color=TEXT, font=('Consolas', 12))
-        self.blocks_box.grid(row=1, column=0, sticky='ew', padx=12, pady=(0, 12))
+        self.blocks_box.grid(row=1, column=0, sticky='ew', padx=12, pady=(0, 6))
+        selector_row = ctk.CTkFrame(blocks, fg_color='transparent')
+        selector_row.grid(row=2, column=0, sticky='w', padx=12, pady=(0, 12))
+        self._label(selector_row, 'SELECT ACTIVE BLOCK TO UNBLOCK:', 11, MUTED, True).pack(side='left', padx=(0, 10))
+        self.block_selection = ctk.CTkOptionMenu(selector_row, values=['No active blocks'], width=190, command=self._select_block)
+        self.block_selection.pack(side='left')
+        self.block_selection.set('No active blocks')
 
         footer = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=12)
         footer.grid(row=2, column=0, sticky='ew', padx=16, pady=(8, 14))
@@ -169,7 +182,8 @@ class Dashboard(ctk.CTk):
         self.ip_entry.grid(row=0, column=2, padx=(12, 5))
         ctk.CTkButton(footer, text='Block IP', width=100, fg_color='#b91c1c', command=self.permanent_block).grid(row=0, column=3, padx=5)
         ctk.CTkButton(footer, text='Unblock IP', width=100, command=self.unblock_ip).grid(row=0, column=4, padx=5)
-        ctk.CTkButton(footer, text='Refresh', width=90, fg_color='#334155', command=self.refresh).grid(row=0, column=5, padx=(5, 16))
+        self.refresh_button = ctk.CTkButton(footer, text='Refresh', width=100, fg_color='#334155', command=lambda: self.refresh(manual=True))
+        self.refresh_button.grid(row=0, column=5, padx=(5, 16))
         footer.grid_columnconfigure(1, weight=1)
 
     @staticmethod
@@ -184,11 +198,32 @@ class Dashboard(ctk.CTk):
             self.refresh()
             self._poll_id = self.after(1500, self._poll)
 
-    def refresh(self) -> None:
-        if self._closing or self._busy:
+    def refresh(self, manual: bool = False) -> None:
+        if self._closing:
+            return
+        if manual:
+            self._refresh_manual = True
+            self._animate_refresh()
+        if self._busy:
             return
         self._busy = True
         threading.Thread(target=self._fetch, daemon=True).start()
+
+    def _animate_refresh(self) -> None:
+        if self._closing or not self._refresh_manual:
+            return
+        frames = ('◐', '◓', '◑', '◒')
+        self.refresh_button.configure(text=f'{frames[self._refresh_frame % len(frames)]} Loading', state='disabled')
+        self._refresh_frame += 1
+        self._refresh_animation_id = self.after(130, self._animate_refresh)
+
+    def _finish_refresh(self) -> None:
+        self._busy = False
+        self._refresh_manual = False
+        if self._refresh_animation_id is not None:
+            self.after_cancel(self._refresh_animation_id)
+            self._refresh_animation_id = None
+        self.refresh_button.configure(text='Refresh', state='normal')
 
     def _fetch(self) -> None:
         try:
@@ -197,16 +232,16 @@ class Dashboard(ctk.CTk):
             self.queue.put(('data', data))
         except Exception as exc:
             self.queue.put(('error', str(exc)))
-        finally:
-            self._busy = False
 
     def _consume(self) -> None:
         try:
             while True:
                 kind, payload = self.queue.get_nowait()
                 if kind == 'data':
+                    self._finish_refresh()
                     self._render(payload)
                 elif kind == 'error':
+                    self._finish_refresh()
                     self.connection.configure(text='DISCONNECTED', text_color=RED)
                 elif kind == 'mode':
                     self._mode_change_pending = False
@@ -251,7 +286,7 @@ class Dashboard(ctk.CTk):
         if not self._mode_change_pending:
             self.mode_switch.select() if mode == 'automatic' else self.mode_switch.deselect()
         dry_run = bool(status.get('dry_run', True))
-        self.dry_run.configure(text='● SIMULATION ONLY' if dry_run else '● REAL FIREWALL ACTIVE', text_color=AMBER if dry_run else GREEN)
+        self.dry_run.configure(text='● SIMULATION MODE — NO FIREWALL CHANGES' if dry_run else '● REAL MITIGATION ACTIVE', text_color=AMBER if dry_run else GREEN)
         window = status.get('latest_window') or {}
         timestamp = window.get('timestamp')
         self.cards['sources'].configure(text=str(window.get('unique_source_ips', 0)))
@@ -282,6 +317,7 @@ class Dashboard(ctk.CTk):
         self._replace(self.incidents_box, '\n'.join(f"{r.get('attack_type')}  |  {r.get('source_ip') or 'uncertain'}\n  last: {format_timestamp(r.get('last_seen'))}" for r in incidents) or 'No active incidents.')
         blocks = data['blocks']
         self._replace(self.blocks_box, '\n'.join(f"{r.get('ip')}  |  {'SIMULATED' if r.get('dry_run') else 'REAL BLOCK'}  |  {r.get('mode')}  |  expires: {format_timestamp(r.get('expires_at')) if r.get('expires_at') else 'manual unblock'}" for r in blocks) or 'No active blocks.')
+        self._update_block_selector(blocks)
         blocked_ips = {row.get('ip') for row in blocks}
         alerts = [a for a in (data.get('alerts') or []) if a.get('source_ip') not in blocked_ips]
         keys = {(a.get('source_ip'), a.get('attack_type')) for a in alerts}
@@ -304,6 +340,20 @@ class Dashboard(ctk.CTk):
                     self._show_popup(alert)
                     break
 
+    def _select_block(self, ip: str) -> None:
+        if ip in self._block_ips:
+            self.ip_entry.delete(0, 'end')
+            self.ip_entry.insert(0, ip)
+
+    def _update_block_selector(self, blocks: list[dict[str, Any]]) -> None:
+        ips = list(dict.fromkeys(str(row['ip']) for row in blocks if row.get('ip')))
+        if ips == self._block_ips:
+            return
+        current = self.block_selection.get()
+        self._block_ips = ips
+        self.block_selection.configure(values=ips or ['No active blocks'])
+        self.block_selection.set(current if current in ips else 'Select blocked IP' if ips else 'No active blocks')
+
     def _dismiss_popup(self) -> None:
         if self._popup and self._popup.winfo_exists():
             self._popup.destroy()
@@ -315,7 +365,7 @@ class Dashboard(ctk.CTk):
         self._popup_key = (ip, attack_type)
         pop = ctk.CTkToplevel(self, fg_color=PANEL)
         self._popup = pop
-        pop.title('Sentinel | Potential attack')
+        pop.title('DoS Detection and Mitigation | Potential attack')
         pop.geometry('530x420')
         pop.transient(self)
         pop.grid_columnconfigure(0, weight=1)
@@ -386,13 +436,14 @@ class Dashboard(ctk.CTk):
             self._run_action('Block IP', ip, lambda: self.client.permanent_block(ip))
 
     def unblock_ip(self) -> None:
-        ip = self._ip()
+        selected = self.block_selection.get()
+        ip = selected if selected in self._block_ips else self._ip()
         if ip and messagebox.askyesno('Confirm unblock', f'Unblock {ip}?'):
             self._run_action('Unblock IP', ip, lambda: self.client.unblock(ip))
 
     def _close(self) -> None:
         self._closing = True
-        for timer in (self._poll_id, self._queue_id):
+        for timer in (self._poll_id, self._queue_id, self._refresh_animation_id):
             if timer is not None:
                 self.after_cancel(timer)
         self._dismiss_popup()
@@ -400,7 +451,7 @@ class Dashboard(ctk.CTk):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Sentinel Windows dashboard')
+    parser = argparse.ArgumentParser(description='DoS Detection and Mitigation dashboard')
     parser.add_argument('--api-url', required=True)
     parser.add_argument('--token', required=True)
     args = parser.parse_args()
